@@ -40,6 +40,11 @@ asks Agnes (agnes-image-2.5-flash, free) for a PNG, saves it under
 /data/img/<uuid>.png and replies with a LINE image message whose
 URL is PUBLIC_URL + /img/<uuid>.png. Needs AGNES_API_KEY set.
 
+Voice replies: every short text reply is also spoken with Gemini TTS
+(gemini-2.5-flash-preview-tts, voice Kore), saved as MP3 under
+/data/audio/<uuid>.mp3 and served at PUBLIC_URL + /audio/<uuid>.mp3.
+Needs GEMINI_API_KEY set; without it replies are text-only.
+
 Other features:
 - 附近美食： asks the AI for 3-5 places near 台中市西屯區
   永福路 (or the area the user named). No invented addresses
@@ -82,6 +87,11 @@ GROQ_BASE_URL = os.environ.get(
     "GROQ_BASE_URL", "https://api.groq.com/openai/v1"
 ).rstrip("/")
 AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_TTS_MODEL = os.environ.get(
+    "GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts"
+)
+GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Kore")
 AGNES_IMAGE_MODEL = os.environ.get("AGNES_IMAGE_MODEL", "agnes-image-2.5-flash")
 AGNES_BASE_URL = os.environ.get(
     "AGNES_BASE_URL", "https://apihub.agnes-ai.com/v1"
@@ -134,6 +144,21 @@ def _resolve_img_dir():
 
 
 IMG_DIR = _resolve_img_dir()
+
+
+def _resolve_audio_dir():
+    """Prefer the /data volume (survives redeploys); fall back to local."""
+    for base in ("/data", BASE_DIR):
+        try:
+            path = os.path.join(base, "audio")
+            os.makedirs(path, exist_ok=True)
+            return path
+        except Exception as exc:
+            print("audio dir not writable:", base, exc, flush=True)
+    return os.path.join(BASE_DIR, "audio")
+
+
+AUDIO_DIR = _resolve_audio_dir()
 
 SYSTEM_PROMPT = (
     "你是「睡不飽」，LINE 上一個很會聊天的朋友。"
@@ -1285,8 +1310,107 @@ def ask_ai(text: str, user_id: str, context: str, system_prompt=None) -> str:
     return answer
 
 
+MAX_TTS_CHARS = 200
+
+
+def synthesize_speech(text: str):
+    """Text -> spoken MP3 via Gemini TTS.
+
+    Returns (filename, duration_ms), or None when TTS is
+    unavailable, the text is too long, or synthesis fails.
+    """
+    if not GEMINI_API_KEY or not text or len(text) > MAX_TTS_CHARS:
+        return None
+    pcm_path = None
+    mp3_path = None
+    try:
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            + GEMINI_TTS_MODEL
+            + ":generateContent?key="
+            + urllib.parse.quote(GEMINI_API_KEY, safe="")
+        )
+        payload = json.dumps({
+            "contents": [{"parts": [{"text": text}]}],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "voiceConfig": {
+                        "prebuiltVoiceConfig": {"voiceName": GEMINI_TTS_VOICE}
+                    }
+                },
+            },
+        }).encode()
+        req = urllib.request.Request(
+            url, data=payload, method="POST",
+            headers={"Content-Type": "application/json", **UA},
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read().decode("utf-8", "ignore"))
+        part = result["candidates"][0]["content"]["parts"][0]
+        inline = part.get("inlineData") or {}
+        audio_b64 = inline.get("data") or ""
+        if not audio_b64:
+            return None
+        raw = base64.b64decode(audio_b64)
+        name = uuid.uuid4().hex + ".mp3"
+        pcm_path = os.path.join(tempfile.gettempdir(), uuid.uuid4().hex + ".pcm")
+        with open(pcm_path, "wb") as f:
+            f.write(raw)
+        mp3_path = os.path.join(AUDIO_DIR, name)
+        if "L16" in (inline.get("mimeType") or ""):
+            cmd = ["ffmpeg", "-y", "-v", "error",
+                   "-f", "s16le", "-ar", "24000", "-ac", "1",
+                   "-i", pcm_path,
+                   "-codec:a", "libmp3lame", "-q:a", "4", mp3_path]
+        else:
+            wav_path = pcm_path + ".wav"
+            os.rename(pcm_path, wav_path)
+            pcm_path = wav_path
+            cmd = ["ffmpeg", "-y", "-v", "error", "-i", pcm_path,
+                   "-codec:a", "libmp3lame", "-q:a", "4", mp3_path]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            print("ffmpeg tts failed:", proc.stderr[:200], flush=True)
+            try:
+                os.remove(mp3_path)
+            except Exception:
+                pass
+            return None
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", mp3_path],
+            capture_output=True, text=True, timeout=30)
+        duration_ms = int(float(probe.stdout.strip()) * 1000)
+        if duration_ms <= 0 or duration_ms > 60000:
+            try:
+                os.remove(mp3_path)
+            except Exception:
+                pass
+            return None
+        return name, duration_ms
+    except Exception as exc:
+        print("tts failed:", exc, flush=True)
+        return None
+    finally:
+        if pcm_path:
+            try:
+                os.remove(pcm_path)
+            except Exception:
+                pass
+
+
 def reply_message(reply_token: str, text: str) -> None:
-    reply_message_full(reply_token, [{"type": "text", "text": text}])
+    messages = [{"type": "text", "text": text}]
+    audio = synthesize_speech(text)
+    if audio is not None:
+        name, duration_ms = audio
+        messages.append({
+            "type": "audio",
+            "originalContentUrl": PUBLIC_URL + "/audio/" + name,
+            "duration": duration_ms,
+        })
+    reply_message_full(reply_token, messages)
 
 
 def reply_message_full(reply_token: str, messages: list) -> None:
@@ -1716,6 +1840,21 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_response(200)
             self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        m = re.match(r"^/audio/([A-Za-z0-9_-]+\.mp3)$", self.path)
+        if m:
+            path = os.path.join(AUDIO_DIR, m.group(1))
+            try:
+                with open(path, "rb") as f:
+                    body = f.read()
+            except Exception:
+                self._send(404, b"not found")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/mpeg")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
