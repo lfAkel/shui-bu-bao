@@ -642,7 +642,7 @@ def format_weather(display, fc, day_offset, want_now):
         if wind is not None:
             parts.append(f"風速 {wind} 公里/時")
         if code in RAIN_CODES:
-            parts.append("正在下雨，出門記得帶傘")
+            parts.append("欸外面正在下雨，出門記得帶把傘喔！")
         return "，".join(parts)
     idx = min(day_offset, max(len(times) - 1, 0))
     label = DAY_LABELS[day_offset]
@@ -663,7 +663,7 @@ def format_weather(display, fc, day_offset, want_now):
     if pop is not None:
         parts.append(f"降雨機率 {pop}%")
     if code in RAIN_CODES or (pop is not None and pop >= 50):
-        parts.append("會下雨，記得帶傘")
+        parts.append("等下感覺會下雨，出門記得隨手拿把傘喔～")
     return "，".join(parts)
 
 
@@ -1378,19 +1378,19 @@ def _stock_reply():
 
 
 def _weather_reply(text=""):
-    return get_weather(text) or "現在查不到天氣，你晚點再問我。"
+    return get_weather(text) or "欸氣象現在查不到耶，我腦袋卡住了，你晚點再來問我好不好？"
 
 
 def _news_reply():
     news = get_news("台灣")
-    return f"最新新聞：\n{news}" if news else "現在查不到新聞，你晚點再問我。"
+    return f"最新新聞：\n{news}" if news else "糟糕，現在抓不到新聞，你過一下下再來問我啦！"
 
 
 def _memories_reply(user_id):
     mems = list_memories(user_id)
     if not mems:
-        return "我現在還沒記住你什麼事，跟我說「記住…」我就會記下來。"
-    lines = ["我記得這些："]
+        return "我腦袋裡面還沒記你的事捏，想讓我幫忙記的話，跟我說「記住…」就好囉！"
+    lines = ["翻了一下我幫你記的，有這些喔："]
     for i, m in enumerate(reversed(mems), 1):
         lines.append(f"{i}. {m}")
     return "\n".join(lines)
@@ -1399,7 +1399,7 @@ def _memories_reply(user_id):
 def _notes_reply(user_id):
     notes = list_notes(user_id)
     if not notes:
-        return "你現在沒有待辦的事，很閒喔。"
+        return "你目前完全沒有待辦事項欸，過得滿爽的嘛，很閒喔～"
     lines = ["你還沒做的事："]
     for i, (text, due) in enumerate(notes, 1):
         lines.append(f"{i}. {text}" + (f"（{due}）" if due else ""))
@@ -1477,9 +1477,9 @@ def handle_command(text, user_id):
             due = find_time_word(content)
             if due:
                 save_note(user_id, content, due)
-                return True, f"好，我記下來了：{content}（{due}）"
+                return True, f"沒問題，幫你記好了喔：{content}（要在 {due} 搞定）"
             save_memory(user_id, content)
-            return True, f"好，我記住了：{content}"
+            return True, f"收到！我記在腦袋裡了：{content}"
     # forget a memory: 忘記 xxx / 忘掉 xxx
     m = re.match(r"^(?:忘記|忘掉)\s*(.+)$", t, re.DOTALL)
     if m:
@@ -1487,16 +1487,16 @@ def handle_command(text, user_id):
         if keyword:
             n = delete_memory(user_id, keyword)
             if n:
-                return True, f"好，我把跟「{keyword}」有關的記憶刪掉了。"
-            return True, f"我沒找到跟「{keyword}」有關的記憶。"
+                return True, f"OK，關於「{keyword}」的事我通通忘掉囉！"
+            return True, f"欸我想一下…腦袋裡找不到跟「{keyword}」有關的事耶。"
     # to-do done: 做完了 xxx / 完成了 xxx
     m = re.match(r"^(?:做完了|完成了|做完|完成)\s*(.+)$", t, re.DOTALL)
     if m:
         keyword = m.group(1).strip()
         if keyword:
             if complete_note(user_id, keyword):
-                return True, f"好，「{keyword}」做完了，幫你打勾了。"
-            return True, f"我沒找到「{keyword}」這件事，你先看一下待辦清單。"
+                return True, f"太棒了！「{keyword}」搞定，幫你打勾勾囉～"
+            return True, f"欸我翻了一下沒看到「{keyword}」這件事耶，你先去待辦清單看一下？"
     # to-do delete: 刪掉 xxx
     m = re.match(r"^刪掉\s*(.+)$", t, re.DOTALL)
     if m:
@@ -1504,8 +1504,8 @@ def handle_command(text, user_id):
         if keyword:
             n = delete_note(user_id, keyword)
             if n:
-                return True, f"好，我把「{keyword}」從待辦刪掉了。"
-            return True, f"我沒找到「{keyword}」這件事。"
+                return True, f"好勒，幫你把「{keyword}」從待辦清單刪掉囉。"
+            return True, f"奇怪，我找了一下沒看到「{keyword}」這件事。"
     # invoice number in the message (2 letters + 8 digits)
     digits = find_invoice_number(t)
     if digits:
