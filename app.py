@@ -69,6 +69,7 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+import time
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -1424,6 +1425,27 @@ def _tts_once(read_text: str):
                 pass
 
 
+_TTS_EMOJI_RE = re.compile(
+    "["
+    "\U0001F000-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U00002B00-\U00002BFF"
+    "\U0000FE0F"
+    "\U0000200D"
+    "]+"
+)
+
+
+def _tts_text(text: str) -> str:
+    """Make text safe for TTS: drop emoji, flatten newlines.
+
+    Emoji and line breaks can make the TTS model try to
+    generate text instead of reading aloud (HTTP 400).
+    """
+    cleaned = _TTS_EMOJI_RE.sub("", text)
+    return " ".join(cleaned.split()).strip()
+
+
 def synthesize_speech(text: str):
     """Text -> spoken MP3 via Gemini TTS.
 
@@ -1432,11 +1454,17 @@ def synthesize_speech(text: str):
     """
     if not GEMINI_API_KEY or not text or len(text) > MAX_TTS_CHARS:
         return None
-    audio = _tts_once(text)
+    clean = _tts_text(text)
+    if not clean:
+        return None
+    audio = _tts_once(clean)
     if audio is None:
         # Instruction-like text can make the TTS model try to
         # answer instead of reading; quote it and try once more.
-        audio = _tts_once("「" + text + "」")
+        # Wait first: the free tier rate-limits back-to-back
+        # requests (HTTP 429).
+        time.sleep(5)
+        audio = _tts_once("「" + clean + "」")
     return audio
 
 
