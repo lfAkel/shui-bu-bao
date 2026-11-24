@@ -1313,14 +1313,8 @@ def ask_ai(text: str, user_id: str, context: str, system_prompt=None) -> str:
 MAX_TTS_CHARS = 200
 
 
-def synthesize_speech(text: str):
-    """Text -> spoken MP3 via Gemini TTS.
-
-    Returns (filename, duration_ms), or None when TTS is
-    unavailable, the text is too long, or synthesis fails.
-    """
-    if not GEMINI_API_KEY or not text or len(text) > MAX_TTS_CHARS:
-        return None
+def _tts_once(read_text: str):
+    """One Gemini TTS attempt. Returns (filename, duration_ms) or None."""
     pcm_path = None
     mp3_path = None
     try:
@@ -1331,7 +1325,7 @@ def synthesize_speech(text: str):
             + urllib.parse.quote(GEMINI_API_KEY, safe="")
         )
         payload = json.dumps({
-            "contents": [{"parts": [{"text": text}]}],
+            "contents": [{"parts": [{"text": read_text}]}],
             "generationConfig": {
                 "responseModalities": ["AUDIO"],
                 "speechConfig": {
@@ -1345,12 +1339,23 @@ def synthesize_speech(text: str):
             url, data=payload, method="POST",
             headers={"Content-Type": "application/json", **UA},
         )
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            result = json.loads(resp.read().decode("utf-8", "ignore"))
-        part = result["candidates"][0]["content"]["parts"][0]
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                result = json.loads(resp.read().decode("utf-8", "ignore"))
+        except urllib.error.HTTPError as exc:
+            print("tts http error:", exc.code, flush=True)
+            return None
+        try:
+            part = result["candidates"][0]["content"]["parts"][0]
+        except Exception:
+            print("tts bad shape:", list(result.keys()),
+                  [list(c.keys()) for c in result.get("candidates", [])][:1],
+                  flush=True)
+            return None
         inline = part.get("inlineData") or {}
         audio_b64 = inline.get("data") or ""
         if not audio_b64:
+            print("tts no audio data", flush=True)
             return None
         raw = base64.b64decode(audio_b64)
         name = uuid.uuid4().hex + ".mp3"
@@ -1398,6 +1403,22 @@ def synthesize_speech(text: str):
                 os.remove(pcm_path)
             except Exception:
                 pass
+
+
+def synthesize_speech(text: str):
+    """Text -> spoken MP3 via Gemini TTS.
+
+    Returns (filename, duration_ms), or None when TTS is
+    unavailable, the text is too long, or synthesis fails.
+    """
+    if not GEMINI_API_KEY or not text or len(text) > MAX_TTS_CHARS:
+        return None
+    audio = _tts_once(text)
+    if audio is None:
+        # Instruction-like text can make the TTS model try to
+        # answer instead of reading; quote it and try once more.
+        audio = _tts_once("「" + text + "」")
+    return audio
 
 
 def reply_message(reply_token: str, text: str) -> None:
