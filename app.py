@@ -8,7 +8,7 @@ replies in a background thread, so a slow AI call never makes
 LINE time out the webhook (LINE allows about 2 seconds).
 
 Reply logic for a text message:
-- Commands (/股價 /天氣 /新聞 /記住 /待辦 /發票 /美食 /選單
+- Commands (/股價 /天氣 /新聞 /記住 /待辦 /發票 /美食 /生圖 /選單
   and their plain-text forms) are handled directly.
 - Long-term memory and to-dos live in SQLite (data/memory.db):
   「記住…」saves a fact, 「幫我記住明天…」saves a to-do,
@@ -35,6 +35,11 @@ Media messages:
   Excel / plain text, then asks the chat model to summarise.
 - Audio: not supported yet, replies so.
 
+Image generation (/生圖 <描述>, 生圖 <描述>, 幫我畫 <描述>):
+asks Agnes (agnes-image-2.5-flash, free) for a PNG, saves it under
+/data/img/<uuid>.png and replies with a LINE image message whose
+URL is PUBLIC_URL + /img/<uuid>.png. Needs AGNES_API_KEY set.
+
 Other features:
 - 附近美食： asks the AI for 3-5 places near 台中市西屯區
   永福路 (or the area the user named). No invented addresses
@@ -60,6 +65,7 @@ import threading
 import urllib.request
 import urllib.error
 import urllib.parse
+import uuid
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -74,6 +80,14 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_BASE_URL = os.environ.get(
     "GROQ_BASE_URL", "https://api.groq.com/openai/v1"
+).rstrip("/")
+AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
+AGNES_IMAGE_MODEL = os.environ.get("AGNES_IMAGE_MODEL", "agnes-image-2.5-flash")
+AGNES_BASE_URL = os.environ.get(
+    "AGNES_BASE_URL", "https://apihub.agnes-ai.com/v1"
+).rstrip("/")
+PUBLIC_URL = os.environ.get(
+    "PUBLIC_URL", "https://shui-bu-bao-rfx57zqs-workspace-lfakel.cloady.io"
 ).rstrip("/")
 VISION_MODEL = os.environ.get("VISION_MODEL", "free/gpt-6-luna")
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
@@ -104,6 +118,21 @@ def _resolve_db_path():
 
 DB_PATH = os.environ.get("MEMORY_DB_PATH") or _resolve_db_path()
 INVOICE_JSON_PATH = os.path.join(BASE_DIR, "winning_numbers.json")
+
+
+def _resolve_img_dir():
+    """Prefer the /data volume (survives redeploys); fall back to local."""
+    for base in ("/data", BASE_DIR):
+        try:
+            path = os.path.join(base, "img")
+            os.makedirs(path, exist_ok=True)
+            return path
+        except Exception as exc:
+            print("img dir not writable:", base, exc, flush=True)
+    return os.path.join(BASE_DIR, "img")
+
+
+IMG_DIR = _resolve_img_dir()
 
 SYSTEM_PROMPT = (
     "你是「睡不飽」，LINE 上一個很會聊天的朋友。"
@@ -993,6 +1022,7 @@ MENU_ITEMS = [
     ("記事情", "/待辦"),
     ("發票", "/發票"),
     ("美食", "/美食"),
+    ("生圖", "/生圖"),
 ]
 
 
@@ -1278,6 +1308,58 @@ def reply_message_full(reply_token: str, messages: list) -> None:
         print("reply status", resp.status, flush=True)
 
 
+def generate_image(prompt: str) -> bytes:
+    """Call Agnes image generation. Returns PNG bytes."""
+    payload = json.dumps(
+        {
+            "model": AGNES_IMAGE_MODEL,
+            "prompt": prompt,
+            "size": "1K",
+            "ratio": "1:1",
+            "extra_body": {"response_format": "b64_json"},
+        }
+    ).encode()
+    req = urllib.request.Request(
+        AGNES_BASE_URL + "/images/generations",
+        data=payload,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + AGNES_API_KEY,
+        },
+    )
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    items = data.get("data") or []
+    if not items or not items[0].get("b64_json"):
+        raise ValueError("no image in Agnes reply")
+    return base64.b64decode(items[0]["b64_json"])
+
+
+def handle_draw(reply_token: str, prompt: str, user_id: str) -> None:
+    """Generate an image in a background thread and reply with it."""
+    try:
+        if not AGNES_API_KEY:
+            reply_message(reply_token, "生圖還沒設定好，等我一下。")
+            return
+        png = generate_image(prompt)
+        name = uuid.uuid4().hex + ".png"
+        path = os.path.join(IMG_DIR, name)
+        with open(path, "wb") as f:
+            f.write(png)
+        url = PUBLIC_URL + "/img/" + name
+        reply_message_full(
+            reply_token,
+            [{"type": "image", "originalContentUrl": url, "previewImageUrl": url}],
+        )
+    except Exception as exc:
+        print("draw failed:", exc, flush=True)
+        try:
+            reply_message(reply_token, "這張圖生不出來，你換個描述再試一次。")
+        except Exception:
+            pass
+
+
 # ---- command routing ----
 
 def _record_direct(user_id, user_text, answer):
@@ -1358,6 +1440,15 @@ def handle_command(text, user_id):
     # menu
     if t in ("/選單", "選單", "功能", "help"):
         return True, None
+    # image generation: /生圖 xxx / 生圖 xxx / 幫我畫 xxx
+    if t in ("/生圖", "生圖", "幫我畫"):
+        return True, "你想畫什麼？跟我說一下，我幫你畫。"
+    m = re.match(r"^(?:/生圖|生圖|幫我畫)\s*(.+)$", t, re.DOTALL)
+    if m:
+        prompt = m.group(1).strip()
+        if not prompt:
+            return True, "你想畫什麼？跟我說一下，我幫你畫。"
+        return True, "DRAW:" + prompt[:200]
     # stocks / weather / news
     if t == "/股價":
         return True, _stock_reply()
@@ -1429,6 +1520,13 @@ def handle_text(reply_token: str, text: str, user_id: str) -> None:
             if answer is None:
                 reply_message_full(reply_token, [build_menu_message()])
                 _record_direct(user_id, text, "（選單）")
+            elif answer.startswith("DRAW:"):
+                threading.Thread(
+                    target=handle_draw,
+                    args=(reply_token, answer[5:], user_id),
+                    daemon=True,
+                ).start()
+                _record_direct(user_id, text, "（生圖中）")
             else:
                 reply_message(reply_token, answer)
                 _record_direct(user_id, text, answer)
@@ -1548,6 +1646,21 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        m = re.match(r"^/img/([A-Za-z0-9_-]+\.png)$", self.path)
+        if m:
+            path = os.path.join(IMG_DIR, m.group(1))
+            try:
+                with open(path, "rb") as f:
+                    body = f.read()
+            except Exception:
+                self._send(404, b"not found")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self._send(200, b"ok")
 
     def do_POST(self):
