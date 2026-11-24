@@ -21,8 +21,10 @@ Reply logic for a text message:
   default openai/gpt-oss-120b) with the live data and the
   user's stored memories as context, and replies with its answer.
   If Groq fails or has no key, falls back to Apinex (model from
-  APINEX_MODEL, default free/deepseek-v4.1-flash).
-- Without either key, or if both AI calls fail, falls back to
+  APINEX_MODEL, default free/deepseek-v4.1-flash). If Apinex also
+  fails, falls back to Mistral (model from MISTRAL_MODEL,
+  default ministral-8b-latest).
+- Without any key, or if all AI calls fail, falls back to
   echoing "收到：" + the user's text, so the bot always
   answers something.
 
@@ -86,12 +88,17 @@ GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_BASE_URL = os.environ.get(
     "GROQ_BASE_URL", "https://api.groq.com/openai/v1"
 ).rstrip("/")
+MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "")
+MISTRAL_MODEL = os.environ.get("MISTRAL_MODEL", "ministral-8b-latest")
+MISTRAL_BASE_URL = os.environ.get(
+    "MISTRAL_BASE_URL", "https://api.mistral.ai/v1"
+).rstrip("/")
 AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_TTS_MODEL = os.environ.get(
     "GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts"
 )
-GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Kore")
+GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Leda")
 AGNES_IMAGE_MODEL = os.environ.get("AGNES_IMAGE_MODEL", "agnes-image-2.5-flash")
 AGNES_BASE_URL = os.environ.get(
     "AGNES_BASE_URL", "https://apihub.agnes-ai.com/v1"
@@ -1288,7 +1295,8 @@ def ask_ai(text: str, user_id: str, context: str, system_prompt=None) -> str:
     messages = [{"role": "system", "content": system}]
     messages.extend(get_history(user_id))
     messages.append({"role": "user", "content": text})
-    # Groq first: fast and free. Apinex pro is the fallback.
+    # Groq first: fast and free. Apinex is the second fallback,
+    # Mistral (ministral-8b) is the last resort.
     if GROQ_API_KEY:
         try:
             answer = post_chat(
@@ -1300,10 +1308,21 @@ def ask_ai(text: str, user_id: str, context: str, system_prompt=None) -> str:
             answer = answer[:4000]
             save_history_turn(user_id, text, answer)
             return answer
-    if not APINEX_API_KEY:
+    if APINEX_API_KEY:
+        try:
+            answer = post_chat(
+                APINEX_BASE_URL, APINEX_API_KEY, APINEX_MODEL, messages, 25
+            )
+        except Exception as exc:
+            print("Apinex failed, falling back to Mistral:", exc, flush=True)
+        else:
+            answer = answer[:4000]
+            save_history_turn(user_id, text, answer)
+            return answer
+    if not MISTRAL_API_KEY:
         raise ValueError("no AI key set")
     answer = post_chat(
-        APINEX_BASE_URL, APINEX_API_KEY, APINEX_MODEL, messages, 25
+        MISTRAL_BASE_URL, MISTRAL_API_KEY, MISTRAL_MODEL, messages, 25
     )
     answer = answer[:4000]
     save_history_turn(user_id, text, answer)
