@@ -33,7 +33,7 @@ Media messages:
   asks the vision model to sum them up.
 - File: downloads it and extracts text from PDF / Word /
   Excel / plain text, then asks the chat model to summarise.
-- Audio: not supported yet, replies so.
+- Audio: transcribed with Groq Whisper, then handled like text.
 
 Image generation (/生圖 <描述>, 生圖 <描述>, 幫我畫 <描述>):
 asks Agnes (agnes-image-2.5-flash, free) for a PNG, saves it under
@@ -93,6 +93,7 @@ VISION_MODEL = os.environ.get("VISION_MODEL", "free/gpt-6-luna")
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_VIDEO_BYTES = 40 * 1024 * 1024
+MAX_AUDIO_BYTES = 10 * 1024 * 1024
 MAX_EXTRACT_CHARS = 12000
 WEATHER_URL = os.environ.get(
     "WEATHER_URL", "https://cwa-weather-api.r-l-s.workers.dev/weather"
@@ -1557,6 +1558,53 @@ def handle_text(reply_token: str, text: str, user_id: str) -> None:
         print("reply failed:", exc, flush=True)
 
 
+def transcribe_audio(data: bytes):
+    """Transcribe voice audio with Groq Whisper.
+
+    Returns the transcribed text, or None when it fails.
+    """
+    if not GROQ_API_KEY:
+        return None
+    boundary = "----muse-audio-" + uuid.uuid4().hex
+    body = io.BytesIO()
+    body.write(("--" + boundary + "\r\n").encode())
+    body.write(
+        b'Content-Disposition: form-data; name="model"\r\n\r\n'
+        b"whisper-large-v3-turbo\r\n"
+    )
+    body.write(("--" + boundary + "\r\n").encode())
+    body.write(
+        b'Content-Disposition: form-data; name="language"\r\n\r\n'
+        b"zh\r\n"
+    )
+    body.write(("--" + boundary + "\r\n").encode())
+    body.write(
+        b'Content-Disposition: form-data; name="file"; '
+        b'filename="voice.m4a"\r\n'
+        b"Content-Type: audio/m4a\r\n\r\n"
+    )
+    body.write(data)
+    body.write(("\r\n--" + boundary + "--\r\n").encode())
+    req = urllib.request.Request(
+        GROQ_BASE_URL.rstrip("/") + "/audio/transcriptions",
+        data=body.getvalue(),
+        method="POST",
+        headers={
+            "Authorization": "Bearer " + GROQ_API_KEY,
+            "Content-Type": "multipart/form-data; boundary=" + boundary,
+            **UA,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read().decode("utf-8", "ignore"))
+    except Exception as exc:
+        print("transcribe failed:", exc, flush=True)
+        return None
+    text = (result.get("text") or "").strip()
+    return text or None
+
+
 def handle_media(reply_token: str, message: dict, user_id: str) -> None:
     """Images, videos and files: download, understand, reply."""
     mtype = message.get("type", "")
@@ -1622,7 +1670,18 @@ def handle_media(reply_token: str, message: dict, user_id: str) -> None:
                         "",
                     )
         elif mtype == "audio":
-            answer = "語音我還聽不懂，先用打字的，或傳圖片、檔案給我。"
+            data = download_content(mid, MAX_AUDIO_BYTES)
+            if data is None:
+                answer = "語音下載失敗，你再傳一次看看。"
+            elif data == b"":
+                answer = "這段語音太長了，先傳短一點的。"
+            else:
+                text = transcribe_audio(data)
+                if not text:
+                    answer = "這段語音我聽不清楚，你再講一次看看，或改用打字的。"
+                else:
+                    handle_text(reply_token, text, user_id)
+                    return
         else:
             return
     except Exception as exc:
