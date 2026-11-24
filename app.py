@@ -23,7 +23,9 @@ Reply logic for a text message:
   If Groq fails or has no key, falls back to Apinex (model from
   APINEX_MODEL, default free/deepseek-v4.1-flash). If Apinex also
   fails, falls back to Mistral (model from MISTRAL_MODEL,
-  default ministral-8b-latest).
+  default ministral-8b-latest). If Mistral also fails, falls
+  back to AgentScope (model from AGENTSCOPE_MODEL, default
+  qwen3.8-flash).
 - Without any key, or if all AI calls fail, falls back to
   echoing "收到：" + the user's text, so the bot always
   answers something.
@@ -93,6 +95,11 @@ MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "")
 MISTRAL_MODEL = os.environ.get("MISTRAL_MODEL", "ministral-8b-latest")
 MISTRAL_BASE_URL = os.environ.get(
     "MISTRAL_BASE_URL", "https://api.mistral.ai/v1"
+).rstrip("/")
+AGENTSCOPE_API_KEY = os.environ.get("AGENTSCOPE_API_KEY", "")
+AGENTSCOPE_MODEL = os.environ.get("AGENTSCOPE_MODEL", "qwen3.8-flash")
+AGENTSCOPE_BASE_URL = os.environ.get(
+    "AGENTSCOPE_BASE_URL", "https://platform.agentscope.io/v1"
 ).rstrip("/")
 AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -1297,7 +1304,8 @@ def ask_ai(text: str, user_id: str, context: str, system_prompt=None) -> str:
     messages.extend(get_history(user_id))
     messages.append({"role": "user", "content": text})
     # Groq first: fast and free. Apinex is the second fallback,
-    # Mistral (ministral-8b) is the last resort.
+    # Mistral (ministral-8b) the third, AgentScope (qwen3.8-flash)
+    # the last resort.
     if GROQ_API_KEY:
         try:
             answer = post_chat(
@@ -1320,10 +1328,21 @@ def ask_ai(text: str, user_id: str, context: str, system_prompt=None) -> str:
             answer = answer[:4000]
             save_history_turn(user_id, text, answer)
             return answer
-    if not MISTRAL_API_KEY:
+    if MISTRAL_API_KEY:
+        try:
+            answer = post_chat(
+                MISTRAL_BASE_URL, MISTRAL_API_KEY, MISTRAL_MODEL, messages, 25
+            )
+        except Exception as exc:
+            print("Mistral failed, falling back to AgentScope:", exc, flush=True)
+        else:
+            answer = answer[:4000]
+            save_history_turn(user_id, text, answer)
+            return answer
+    if not AGENTSCOPE_API_KEY:
         raise ValueError("no AI key set")
     answer = post_chat(
-        MISTRAL_BASE_URL, MISTRAL_API_KEY, MISTRAL_MODEL, messages, 25
+        AGENTSCOPE_BASE_URL, AGENTSCOPE_API_KEY, AGENTSCOPE_MODEL, messages, 25
     )
     answer = answer[:4000]
     save_history_turn(user_id, text, answer)
