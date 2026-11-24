@@ -1457,12 +1457,14 @@ def synthesize_speech(text: str):
     clean = _tts_text(text)
     if not clean:
         return None
-    audio = _tts_once(clean)
+    # Frame the text as a read-aloud instruction. Plain text
+    # makes the TTS model try to answer it instead (HTTP 400);
+    # the "Say ..." framing tells it to only read aloud, and
+    # the cheerful tone matches the bot's lively voice.
+    audio = _tts_once("Say in a cheerful tone: " + clean)
     if audio is None:
-        # Instruction-like text can make the TTS model try to
-        # answer instead of reading; quote it and try once more.
-        # Wait first: the free tier rate-limits back-to-back
-        # requests (HTTP 429).
+        # Quote it and try once more. Wait first: the free
+        # tier rate-limits back-to-back requests (HTTP 429).
         time.sleep(5)
         audio = _tts_once("「" + clean + "」")
     return audio
