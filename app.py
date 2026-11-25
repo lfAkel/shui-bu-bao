@@ -52,7 +52,8 @@ under /data/audio/<uuid>.mp3 and served at PUBLIC_URL +
 default zh-TW-YunJheNeural, free, no key); if it fails, falls
 back to Gemini TTS (gemini-2.5-flash-preview-tts, voice Leda).
 Needs GEMINI_API_KEY set for the fallback; without either,
-replies are text-only.
+replies are text-only. Voice replies are paused unless
+VOICE_ENABLED=1.
 
 Other features:
 - 附近美食： asks the AI for 3-5 places near 台中市西屯區
@@ -119,6 +120,7 @@ GEMINI_TTS_MODEL = os.environ.get(
 )
 GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Leda")
 EDGE_TTS_VOICE = os.environ.get("EDGE_TTS_VOICE", "zh-TW-YunJheNeural")
+VOICE_ENABLED = os.environ.get("VOICE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 AGNES_IMAGE_MODEL = os.environ.get("AGNES_IMAGE_MODEL", "agnes-image-2.5-flash")
 AGNES_BASE_URL = os.environ.get(
     "AGNES_BASE_URL", "https://apihub.agnes-ai.com/v1"
@@ -1546,6 +1548,9 @@ def synthesize_speech(text: str):
     or None when TTS is unavailable, the text is too long, or
     synthesis fails.
     """
+    if not VOICE_ENABLED:
+        # Voice replies are paused; re-enable with VOICE_ENABLED=1.
+        return None
     if not text or len(text) > MAX_TTS_CHARS:
         return None
     clean = _tts_text(text)
