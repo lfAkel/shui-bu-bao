@@ -25,7 +25,9 @@ Reply logic for a text message:
   fails, falls back to Mistral (model from MISTRAL_MODEL,
   default ministral-8b-latest). If Mistral also fails, falls
   back to AgentScope (model from AGENTSCOPE_MODEL, default
-  qwen3.8-flash).
+  qwen3.8-flash). If AgentScope also fails, falls
+  back to Requesty (model from REQUESTY_MODEL, default
+  google/gemma-4-31b-it).
 - Without any key, or if all AI calls fail, falls back to
   echoing "收到：" + the user's text, so the bot always
   answers something.
@@ -100,6 +102,12 @@ AGENTSCOPE_API_KEY = os.environ.get("AGENTSCOPE_API_KEY", "")
 AGENTSCOPE_MODEL = os.environ.get("AGENTSCOPE_MODEL", "qwen3.8-flash")
 AGENTSCOPE_BASE_URL = os.environ.get(
     "AGENTSCOPE_BASE_URL", "https://platform.agentscope.io/v1"
+).rstrip("/")
+
+REQUESTY_API_KEY = os.environ.get("REQUESTY_API_KEY", "")
+REQUESTY_MODEL = os.environ.get("REQUESTY_MODEL", "google/gemma-4-31b-it")
+REQUESTY_BASE_URL = os.environ.get(
+    "REQUESTY_BASE_URL", "https://router.requesty.ai/v1"
 ).rstrip("/")
 AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -1305,7 +1313,7 @@ def ask_ai(text: str, user_id: str, context: str, system_prompt=None) -> str:
     messages.append({"role": "user", "content": text})
     # Groq first: fast and free. Apinex is the second fallback,
     # Mistral (ministral-8b) the third, AgentScope (qwen3.8-flash)
-    # the last resort.
+    # the fourth, Requesty (gemma-4-31b-it) the last resort.
     if GROQ_API_KEY:
         try:
             answer = post_chat(
@@ -1339,10 +1347,21 @@ def ask_ai(text: str, user_id: str, context: str, system_prompt=None) -> str:
             answer = answer[:4000]
             save_history_turn(user_id, text, answer)
             return answer
-    if not AGENTSCOPE_API_KEY:
+    if AGENTSCOPE_API_KEY:
+        try:
+            answer = post_chat(
+                AGENTSCOPE_BASE_URL, AGENTSCOPE_API_KEY, AGENTSCOPE_MODEL, messages, 25
+            )
+        except Exception as exc:
+            print("AgentScope failed, falling back to Requesty:", exc, flush=True)
+        else:
+            answer = answer[:4000]
+            save_history_turn(user_id, text, answer)
+            return answer
+    if not REQUESTY_API_KEY:
         raise ValueError("no AI key set")
     answer = post_chat(
-        AGENTSCOPE_BASE_URL, AGENTSCOPE_API_KEY, AGENTSCOPE_MODEL, messages, 25
+        REQUESTY_BASE_URL, REQUESTY_API_KEY, REQUESTY_MODEL, messages, 60
     )
     answer = answer[:4000]
     save_history_turn(user_id, text, answer)
