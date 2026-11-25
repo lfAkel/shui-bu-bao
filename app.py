@@ -46,10 +46,13 @@ asks Agnes (agnes-image-2.5-flash, free) for a PNG, saves it under
 /data/img/<uuid>.png and replies with a LINE image message whose
 URL is PUBLIC_URL + /img/<uuid>.png. Needs AGNES_API_KEY set.
 
-Voice replies: every short text reply is also spoken with Gemini TTS
-(gemini-2.5-flash-preview-tts, voice Kore), saved as MP3 under
-/data/audio/<uuid>.mp3 and served at PUBLIC_URL + /audio/<uuid>.mp3.
-Needs GEMINI_API_KEY set; without it replies are text-only.
+Voice replies: every short text reply is also spoken, saved as MP3
+under /data/audio/<uuid>.mp3 and served at PUBLIC_URL +
+/audio/<uuid>.mp3. Edge TTS first (Taiwanese Mandarin voice,
+default zh-TW-YunJheNeural, free, no key); if it fails, falls
+back to Gemini TTS (gemini-2.5-flash-preview-tts, voice Leda).
+Needs GEMINI_API_KEY set for the fallback; without either,
+replies are text-only.
 
 Other features:
 - 附近美食： asks the AI for 3-5 places near 台中市西屯區
@@ -115,6 +118,7 @@ GEMINI_TTS_MODEL = os.environ.get(
     "GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts"
 )
 GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Leda")
+EDGE_TTS_VOICE = os.environ.get("EDGE_TTS_VOICE", "zh-TW-YunJheNeural")
 AGNES_IMAGE_MODEL = os.environ.get("AGNES_IMAGE_MODEL", "agnes-image-2.5-flash")
 AGNES_BASE_URL = os.environ.get(
     "AGNES_BASE_URL", "https://apihub.agnes-ai.com/v1"
@@ -1484,27 +1488,83 @@ def _tts_text(text: str) -> str:
     return " ".join(cleaned.split()).strip()
 
 
-def synthesize_speech(text: str):
-    """Text -> spoken MP3 via Gemini TTS.
+def _probe_mp3_duration(mp3_path):
+    """ffprobe an MP3 and return duration in ms, or None if invalid."""
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", mp3_path],
+        capture_output=True, text=True, timeout=30)
+    try:
+        duration_ms = int(float(probe.stdout.strip()) * 1000)
+    except Exception:
+        return None
+    if duration_ms <= 0 or duration_ms > 60000:
+        return None
+    return duration_ms
 
-    Returns (filename, duration_ms), or None when TTS is
-    unavailable, the text is too long, or synthesis fails.
+
+def _tts_edge_once(clean_text: str):
+    """One Edge TTS attempt (Taiwanese Mandarin, free, no key).
+
+    Returns (filename, duration_ms) or None.
     """
-    if not GEMINI_API_KEY or not text or len(text) > MAX_TTS_CHARS:
+    try:
+        import asyncio
+        import edge_tts
+    except Exception as exc:
+        print("edge tts import failed:", exc, flush=True)
+        return None
+    name = uuid.uuid4().hex + ".mp3"
+    mp3_path = os.path.join(AUDIO_DIR, name)
+    try:
+        async def _run():
+            communicate = edge_tts.Communicate(clean_text, EDGE_TTS_VOICE)
+            await communicate.save(mp3_path)
+        asyncio.run(_run())
+    except Exception as exc:
+        print("edge tts failed:", exc, flush=True)
+        try:
+            os.remove(mp3_path)
+        except Exception:
+            pass
+        return None
+    duration_ms = _probe_mp3_duration(mp3_path)
+    if duration_ms is None:
+        try:
+            os.remove(mp3_path)
+        except Exception:
+            pass
+        return None
+    return name, duration_ms
+
+
+def synthesize_speech(text: str):
+    """Text -> spoken MP3 via Edge TTS (Taiwanese Mandarin).
+
+    Edge TTS first (free, no key, zh-TW voice); if it fails,
+    falls back to Gemini TTS. Returns (filename, duration_ms),
+    or None when TTS is unavailable, the text is too long, or
+    synthesis fails.
+    """
+    if not text or len(text) > MAX_TTS_CHARS:
         return None
     clean = _tts_text(text)
     if not clean:
         return None
+    audio = _tts_edge_once(clean)
+    if audio is not None:
+        return audio
+    if not GEMINI_API_KEY:
+        return None
     # Frame the text as a read-aloud instruction. Plain text
     # makes the TTS model try to answer it instead (HTTP 400);
-    # the "Say ..." framing tells it to only read aloud, and
-    # the cheerful tone matches the bot's lively voice.
+    # the "Say ..." framing tells it to only read aloud.
     audio = _tts_once("Say in a cheerful tone: " + clean)
     if audio is None:
         # Quote it and try once more. Wait first: the free
         # tier rate-limits back-to-back requests (HTTP 429).
         time.sleep(5)
-        audio = _tts_once("「" + clean + "」")
+        audio = _tts_once("\u300c" + clean + "\u300d")
     return audio
 
 
