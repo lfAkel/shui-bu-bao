@@ -98,6 +98,7 @@ GROQ_BASE_URL = os.environ.get(
     "GROQ_BASE_URL", "https://api.groq.com/openai/v1"
 ).rstrip("/")
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "")
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 MISTRAL_MODEL = os.environ.get("MISTRAL_MODEL", "ministral-8b-latest")
 MISTRAL_BASE_URL = os.environ.get(
     "MISTRAL_BASE_URL", "https://api.mistral.ai/v1"
@@ -818,8 +819,50 @@ def get_weather_xitun():
         return ""
 
 
+def search_tavily(query):
+    """Tavily search for news headlines, returns same format as get_news."""
+    if not TAVILY_API_KEY:
+        return ""
+    
+    try:
+        url = "https://api.tavily.com/search"
+        headers = {
+            "Authorization": "Bearer " + TAVILY_API_KEY,
+            "User-Agent": UA["User-Agent"],
+            "Content-Type": "application/json"
+        }
+        data = json.dumps({
+            "query": query,
+            "search_depth": "basic",
+            "max_results": 5,
+            "include_answer": False
+        }).encode("utf-8")
+        
+        req = urllib.request.Request(url, headers=headers, method="POST")
+        with urllib.request.urlopen(req, data, timeout=10) as resp:
+            result = json.loads(resp.read().decode("utf-8", "ignore"))
+            if "results" in result and isinstance(result["results"], list):
+                headlines = []
+                for item in result["results"][:5]:
+                    if item.get("title"):
+                        headlines.append(item["title"].strip())
+                if headlines:
+                    return "\n".join(f"- {t}" for t in headlines)
+    except Exception as exc:
+        print("Tavily search failed:", exc, flush=True)
+        return ""
+    
+    return ""
+
+
 def get_news(query):
-    """Top 5 Google News headlines for the query, or ''."""
+    """Top 5 Google News headlines for the query, or ''. Try Tavily first, then Google News."""
+    # Try Tavily first
+    news_result = search_tavily(query)
+    if news_result:
+        return news_result
+        
+    # Fallback to Google News RSS
     url = (
         "https://news.google.com/rss/search?q="
         + urllib.request.quote(query)
