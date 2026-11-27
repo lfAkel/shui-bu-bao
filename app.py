@@ -139,6 +139,10 @@ WEATHER_URL = os.environ.get(
     "WEATHER_URL", "https://cwa-weather-api.r-l-s.workers.dev/weather"
 )
 PORT = int(os.environ.get("PORT", "8000"))
+MEMORY_BACKUP_URL = os.environ.get(
+    "MEMORY_BACKUP_URL", "https://shui-bu-bao-backup.r-l-s.workers.dev"
+).rstrip("/")
+MEMORY_BACKUP_TOKEN = os.environ.get("MEMORY_BACKUP_TOKEN", "").strip()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -265,6 +269,207 @@ def _db():
     return sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
 
 
+# ---- memory.db backup / restore ----
+
+_SQLITE_HEADER = b"SQLite format 3\x00"
+BACKUP_CHECK_INTERVAL = 60
+BACKUP_PERIODIC_INTERVAL = 30 * 60
+BACKUP_DIRTY_MIN_INTERVAL = 10 * 60
+
+_backup_lock = threading.Lock()
+_backup_dirty = False
+_backup_last_upload = 0.0
+_backup_thread = None
+
+
+def _mark_memory_dirty():
+    global _backup_dirty
+    with _backup_lock:
+        _backup_dirty = True
+
+
+def _memory_db_is_empty():
+    """True if memory.db is missing or memories/notes/history are all empty."""
+    if not os.path.exists(DB_PATH):
+        return True
+    total = 0
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        try:
+            for table in ("memories", "notes", "history"):
+                try:
+                    total += conn.execute(
+                        "SELECT COUNT(*) FROM " + table
+                    ).fetchone()[0]
+                except sqlite3.Error:
+                    pass
+        finally:
+            conn.close()
+    except Exception as exc:
+        print("memory restore: could not inspect local db:", exc, flush=True)
+        return False
+    return total == 0
+
+
+def _atomic_write_bytes(path, data):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=directory, prefix=".memory.db.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def restore_memory_db_if_needed():
+    """Restore memory.db from the backup worker if local data is empty."""
+    if not MEMORY_BACKUP_TOKEN:
+        return False
+    try:
+        if not _memory_db_is_empty():
+            return False
+        req = urllib.request.Request(
+            MEMORY_BACKUP_URL + "/backup",
+            headers={
+                "User-Agent": UA["User-Agent"],
+                "Authorization": "Bearer " + MEMORY_BACKUP_TOKEN,
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = resp.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                print("memory restore: no backup yet (404)", flush=True)
+            else:
+                print(
+                    "memory restore: backup server returned", exc.code,
+                    flush=True,
+                )
+            return False
+        except Exception as exc:
+            print("memory restore: download failed:", exc, flush=True)
+            return False
+        if not data.startswith(_SQLITE_HEADER):
+            print(
+                "memory restore: downloaded data is not a SQLite database",
+                flush=True,
+            )
+            return False
+        _atomic_write_bytes(DB_PATH, data)
+        print(
+            "memory restore: restored", len(data), "bytes from backup",
+            flush=True,
+        )
+        return True
+    except Exception as exc:
+        print("memory restore: unexpected error:", exc, flush=True)
+        return False
+
+
+def _upload_memory_db():
+    if not MEMORY_BACKUP_TOKEN:
+        return False
+    # Never overwrite a good backup with an empty local db: if the
+    # startup restore failed transiently, the local db is empty and
+    # uploading it would destroy the backup we just failed to fetch.
+    if _memory_db_is_empty():
+        print("memory backup: local db is empty, skip upload", flush=True)
+        return False
+    try:
+        with open(DB_PATH, "rb") as f:
+            data = f.read()
+        req = urllib.request.Request(
+            MEMORY_BACKUP_URL + "/backup",
+            data=data,
+            headers={
+                "User-Agent": UA["User-Agent"],
+                "Authorization": "Bearer " + MEMORY_BACKUP_TOKEN,
+                "Content-Type": "application/octet-stream",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                status = getattr(resp, "status", 200)
+        except urllib.error.HTTPError as exc:
+            print("memory backup: upload failed with HTTP", exc.code, flush=True)
+            return False
+        except Exception as exc:
+            print("memory backup: upload failed:", exc, flush=True)
+            return False
+        if 200 <= status < 300:
+            print("memory backup: uploaded", len(data), "bytes", flush=True)
+            return True
+        print("memory backup: upload failed with HTTP", status, flush=True)
+        return False
+    except Exception as exc:
+        print("memory backup: unexpected error:", exc, flush=True)
+        return False
+
+
+def _memory_backup_loop():
+    global _backup_dirty, _backup_last_upload
+    last_periodic = 0.0
+    while True:
+        try:
+            if not MEMORY_BACKUP_TOKEN:
+                return
+            if not os.path.exists(DB_PATH):
+                time.sleep(BACKUP_CHECK_INTERVAL)
+                continue
+            now = time.time()
+            with _backup_lock:
+                dirty = _backup_dirty
+                last_upload = _backup_last_upload
+            due_periodic = now - last_periodic >= BACKUP_PERIODIC_INTERVAL
+            due_dirty = (
+                dirty and now - last_upload >= BACKUP_DIRTY_MIN_INTERVAL
+            )
+            should_upload = due_dirty
+            if due_periodic:
+                last_periodic = now
+                try:
+                    if os.path.getmtime(DB_PATH) > last_upload:
+                        should_upload = True
+                except OSError:
+                    pass
+            if should_upload and _upload_memory_db():
+                with _backup_lock:
+                    _backup_last_upload = time.time()
+                    _backup_dirty = False
+        except Exception as exc:
+            print("memory backup: loop error:", exc, flush=True)
+        try:
+            time.sleep(BACKUP_CHECK_INTERVAL)
+        except Exception:
+            time.sleep(1)
+
+
+def start_memory_backup_thread():
+    global _backup_thread
+    if not MEMORY_BACKUP_TOKEN:
+        return None
+    if _backup_thread is not None and _backup_thread.is_alive():
+        return _backup_thread
+    _backup_thread = threading.Thread(
+        target=_memory_backup_loop, name="memory-backup", daemon=True
+    )
+    _backup_thread.start()
+    return _backup_thread
+
+
 # ---- long-term memories: facts and preferences about the user ----
 
 def save_memory(user_id, content):
@@ -281,6 +486,7 @@ def save_memory(user_id, content):
             conn.commit()
         finally:
             conn.close()
+    _mark_memory_dirty()
     return True
 
 
@@ -307,9 +513,12 @@ def delete_memory(user_id, keyword):
                 (user_id, "%" + keyword + "%"),
             )
             conn.commit()
-            return cur.rowcount
+            deleted = cur.rowcount
         finally:
             conn.close()
+    if deleted:
+        _mark_memory_dirty()
+    return deleted
 
 
 # ---- to-dos: things the user asked to be reminded of ----
@@ -345,6 +554,7 @@ def save_note(user_id, text, due_text=""):
             conn.commit()
         finally:
             conn.close()
+    _mark_memory_dirty()
     return True
 
 
@@ -377,6 +587,7 @@ def complete_note(user_id, keyword):
                 return 0
             conn.execute("UPDATE notes SET done=1 WHERE id=?", (rows[0][0],))
             conn.commit()
+            _mark_memory_dirty()
             return 1
         finally:
             conn.close()
@@ -391,9 +602,12 @@ def delete_note(user_id, keyword):
                 (user_id, "%" + keyword + "%"),
             )
             conn.commit()
-            return cur.rowcount
+            deleted = cur.rowcount
         finally:
             conn.close()
+    if deleted:
+        _mark_memory_dirty()
+    return deleted
 
 
 # ---- chat history, persisted in SQLite ----
@@ -2129,7 +2343,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    restore_memory_db_if_needed()
     init_db()
+    start_memory_backup_thread()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print("listening on", PORT, flush=True)
     server.serve_forever()
