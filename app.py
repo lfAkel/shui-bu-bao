@@ -381,6 +381,12 @@ def restore_memory_db_if_needed():
 def _upload_memory_db():
     if not MEMORY_BACKUP_TOKEN:
         return False
+    # Never overwrite a good backup with an empty local db: if the
+    # startup restore failed transiently, the local db is empty and
+    # uploading it would destroy the backup we just failed to fetch.
+    if _memory_db_is_empty():
+        print("memory backup: local db is empty, skip upload", flush=True)
+        return False
     try:
         with open(DB_PATH, "rb") as f:
             data = f.read()
