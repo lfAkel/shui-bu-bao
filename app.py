@@ -1684,6 +1684,16 @@ def _news_reply():
     return f"最新新聞：\n{news}" if news else "糟糕，現在抓不到新聞，你過一下下再來問我啦！"
 
 
+def _ping_reply():
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("Asia/Taipei")
+    except Exception:
+        tz = datetime.timezone(datetime.timedelta(hours=8))
+    now = datetime.datetime.now(tz)
+    return f"pong！現在是 {now.strftime('%Y-%m-%d %H:%M')}（台北時間）"
+
+
 def _memories_reply(user_id):
     mems = list_memories(user_id)
     if not mems:
@@ -1738,6 +1748,9 @@ def handle_command(text, user_id):
     # menu
     if t in ("/選單", "選單", "功能", "help"):
         return True, None
+    # ping
+    if t in ("/ping", "ping"):
+        return True, _ping_reply()
     # image generation: /生圖 xxx / 生圖 xxx / 幫我畫 xxx
     if t in ("/生圖", "生圖", "幫我畫"):
         return True, "你想畫什麼？跟我說一下，我幫你畫。"
